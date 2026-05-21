@@ -1,0 +1,1061 @@
+// =====================================================================
+//  Restaurant Booking & CRM — Prisma Schema
+//  Multi-tenant SaaS (PostgreSQL)
+//  Every tenant-scoped table includes `tenantId` and is indexed on it.
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =====================================================================
+//  TENANT  (the restaurant — root of multi-tenancy)
+// =====================================================================
+
+model Tenant {
+  id              String    @id @default(cuid())
+  slug            String    @unique // e.g. "marios-bistro" → marios-bistro.app.com
+  name            String
+  logoUrl         String?
+  coverImageUrl   String?
+  primaryColor    String?   @default("#0F172A") // for white-label theming
+
+  timezone        String    @default("America/New_York")
+  currency        String    @default("USD")
+  locale          String    @default("en-US")
+
+  // Contact
+  contactEmail    String
+  contactPhone    String?
+  websiteUrl      String?
+
+  // Address
+  addressLine1    String?
+  addressLine2    String?
+  city            String?
+  state           String?
+  postalCode      String?
+  country         String    @default("US")
+  latitude        Float?
+  longitude       Float?
+
+  // Restaurant attributes
+  cuisineType     String?
+  priceRange      Int?      @default(2) // 1 = $, 4 = $$$$
+
+  // Flexible per-tenant settings (feature flags, brand voice, etc.)
+  settings        Json?
+
+  // Lifecycle
+  isActive        Boolean   @default(true)
+  onboardingDone  Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  users               User[]
+  tables              Table[]
+  floorSections       FloorSection[]
+  reservations        Reservation[]
+  reservationSettings ReservationSettings?
+  guests              Guest[]
+  guestTags           GuestTag[]
+  guestNotes          GuestNote[]
+  operatingHours      OperatingHours[]
+  specialClosures     SpecialClosure[]
+  loyaltyProgram      LoyaltyProgram?
+  segments            Segment[]
+  messageTemplates    MessageTemplate[]
+  campaigns           Campaign[]
+  notifications       Notification[]
+  auditLogs           AuditLog[]
+  subscription        TenantSubscription?
+  posIntegrations     PosIntegration[]
+  webhooks            Webhook[]
+  apiKeys             ApiKey[]
+  payments            Payment[]
+  waitlistEntries     WaitlistEntry[]
+
+  @@index([slug])
+  @@index([isActive])
+}
+
+// =====================================================================
+//  USERS & AUTH  (Auth.js compatible)
+// =====================================================================
+
+enum UserRole {
+  SUPER_ADMIN // platform operator (us)
+  OWNER       // restaurant owner
+  ADMIN       // restaurant admin
+  MANAGER     // floor / shift manager
+  HOST        // host / hostess (book + seat guests)
+  STAFF       // server / general
+}
+
+model User {
+  id               String    @id @default(cuid())
+  tenantId         String?   // null only for SUPER_ADMIN
+  email            String
+  emailVerified    DateTime?
+  hashedPassword   String?   // null when OAuth-only
+  name             String?
+  image            String?
+  phone            String?
+
+  role             UserRole  @default(STAFF)
+  permissions      Json?     // optional fine-grained overrides
+
+  isActive         Boolean   @default(true)
+  lastLoginAt      DateTime?
+  twoFactorEnabled Boolean   @default(false)
+
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  deletedAt        DateTime?
+
+  tenant              Tenant?       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  accounts            Account[]
+  sessions            Session[]
+  createdReservations Reservation[] @relation("CreatedBy")
+  updatedReservations Reservation[] @relation("UpdatedBy")
+  guestNotes          GuestNote[]
+  auditLogs           AuditLog[]
+  notifications       Notification[]
+  campaignsCreated    Campaign[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@index([email])
+}
+
+// Auth.js standard tables
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// =====================================================================
+//  BILLING / SUBSCRIPTION  (Stripe)
+// =====================================================================
+
+enum SubscriptionPlan {
+  FREE
+  STARTER
+  PROFESSIONAL
+  ENTERPRISE
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  UNPAID
+  INCOMPLETE
+}
+
+model TenantSubscription {
+  id                   String             @id @default(cuid())
+  tenantId             String             @unique
+  stripeCustomerId     String?            @unique
+  stripeSubscriptionId String?            @unique
+  stripePriceId        String?
+
+  // Phase 8: per-tenant Stripe credentials used to charge guest deposits.
+  // Distinct from the SaaS billing fields above. In production this would
+  // be Stripe Connect — for the demo we accept a raw secret key.
+  stripeDepositsEnabled   Boolean? @default(false)
+  stripeSecretKey         String?  // restricted/test key — never logged
+  stripePublishableKey    String?
+  stripeWebhookSecret     String?
+
+  plan                 SubscriptionPlan   @default(FREE)
+  status               SubscriptionStatus @default(TRIALING)
+
+  trialEndsAt          DateTime?
+  currentPeriodStart   DateTime?
+  currentPeriodEnd     DateTime?
+  cancelAtPeriodEnd    Boolean            @default(false)
+  canceledAt           DateTime?
+
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  tenant               Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+}
+
+// =====================================================================
+//  FLOOR PLAN: SECTIONS & TABLES
+// =====================================================================
+
+model FloorSection {
+  id           String   @id @default(cuid())
+  tenantId     String
+  name         String   // "Main Dining", "Bar", "Patio"
+  description  String?
+  displayOrder Int      @default(0)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tables       Table[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+}
+
+enum TableShape {
+  ROUND
+  SQUARE
+  RECTANGLE
+  BOOTH
+  BAR
+}
+
+model Table {
+  id           String     @id @default(cuid())
+  tenantId     String
+  sectionId    String?
+
+  name         String     // "T1", "Patio 5"
+  minCapacity  Int        @default(1)
+  maxCapacity  Int
+  shape        TableShape @default(ROUND)
+
+  // Visual floor-plan position
+  positionX    Float?
+  positionY    Float?
+  rotation     Float?     @default(0)
+
+  isCombinable Boolean    @default(false)
+  isActive     Boolean    @default(true)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  section      FloorSection? @relation(fields: [sectionId], references: [id], onDelete: SetNull)
+  reservations Reservation[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@index([sectionId])
+}
+
+// =====================================================================
+//  OPERATING HOURS & CLOSURES
+// =====================================================================
+
+enum DayOfWeek {
+  SUNDAY
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+}
+
+model OperatingHours {
+  id        String    @id @default(cuid())
+  tenantId  String
+  dayOfWeek DayOfWeek
+  openTime  String    // "11:00" (HH:mm, tenant-local)
+  closeTime String    // "22:00"
+  isClosed  Boolean   @default(false)
+  shiftName String?   // "Lunch", "Dinner"
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, dayOfWeek])
+}
+
+model SpecialClosure {
+  id              String   @id @default(cuid())
+  tenantId        String
+  date            DateTime @db.Date
+  reason          String?
+  isClosedAllDay  Boolean  @default(true)
+  customOpenTime  String?
+  customCloseTime String?
+  createdAt       DateTime @default(now())
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, date])
+  @@index([tenantId, date])
+}
+
+// =====================================================================
+//  RESERVATION SETTINGS  (per-tenant booking rules)
+// =====================================================================
+
+model ReservationSettings {
+  id                       String   @id @default(cuid())
+  tenantId                 String   @unique
+
+  advanceBookingDays       Int      @default(60)
+  minLeadTimeMinutes       Int      @default(30)
+  slotDurationMinutes      Int      @default(15)
+  defaultDiningDurationMin Int      @default(90)
+  maxPartySize             Int      @default(12)
+  largePartyThreshold      Int      @default(8)
+
+  requireConfirmation      Boolean  @default(false)
+  autoConfirm              Boolean  @default(true)
+  allowWaitlist            Boolean  @default(true)
+  collectCreditCard        Boolean  @default(false)
+  noShowChargeAmount       Float?
+
+  // Phase 8: deposits. When > 0 and Stripe is configured, the public widget
+  // sends bookers through Stripe Checkout to pay a deposit before confirming.
+  depositPerPerson         Float?
+  depositRefundPolicy      String?  // free-form text shown on the widget
+
+  sendConfirmationEmail    Boolean  @default(true)
+  sendConfirmationSms      Boolean  @default(false)
+  sendReminderEmail        Boolean  @default(true)
+  sendReminderSms          Boolean  @default(true)
+  reminderHoursBefore      Int      @default(24)
+
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  tenant                   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+}
+
+// =====================================================================
+//  GUESTS  (CRM — 360° profile)
+// =====================================================================
+
+enum GuestVipStatus {
+  NONE
+  REGULAR
+  VIP
+  CELEBRITY
+}
+
+model Guest {
+  id                     String         @id @default(cuid())
+  tenantId               String
+
+  firstName              String
+  lastName               String?
+  email                  String?
+  phone                  String?
+  dateOfBirth            DateTime?      @db.Date
+
+  addressLine1           String?
+  city                   String?
+  state                  String?
+  postalCode             String?
+  country                String?        @default("US")
+
+  // Denormalized metrics (recomputed on visit completion / nightly job)
+  totalVisits            Int            @default(0)
+  totalSpend             Float          @default(0)
+  averageSpend           Float          @default(0)
+  totalNoShows           Int            @default(0)
+  totalCancellations     Int            @default(0)
+  firstVisitAt           DateTime?
+  lastVisitAt            DateTime?
+
+  vipStatus              GuestVipStatus @default(NONE)
+  isBlacklisted          Boolean        @default(false)
+  blacklistReason        String?
+
+  dietaryRestrictions    String[]       @default([])
+  allergies              String[]       @default([])
+  favoriteSeating        String?
+  preferredLanguage      String?        @default("en")
+
+  marketingEmailOptIn    Boolean        @default(false)
+  marketingSmsOptIn      Boolean        @default(false)
+  marketingOptInAt       DateTime?
+  marketingOptOutAt      DateTime?
+
+  source                 String?        // "online", "walk-in", "import", etc.
+  dataDeletionRequestedAt DateTime?     // GDPR/CCPA right-to-erasure flag
+
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+  deletedAt              DateTime?
+
+  tenant                 Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reservations           Reservation[]
+  notes                  GuestNote[]
+  tags                   GuestTagAssignment[]
+  loyaltyAccount         LoyaltyAccount?
+  campaignRecipients     CampaignRecipient[]
+  segmentMembers         SegmentMember[]
+  waitlistEntries        WaitlistEntry[]
+
+  @@unique([tenantId, email])
+  @@unique([tenantId, phone])
+  @@index([tenantId])
+  @@index([tenantId, lastName, firstName])
+  @@index([tenantId, lastVisitAt])
+}
+
+model GuestTag {
+  id        String               @id @default(cuid())
+  tenantId  String
+  name      String               // "Foodie", "Big Spender", "Birthday This Month"
+  color     String?              @default("#3B82F6")
+  isAutoTag Boolean              @default(false) // engine recomputes membership
+  rule      Json?                // criteria for auto-tagging
+  createdAt DateTime             @default(now())
+  updatedAt DateTime             @updatedAt
+
+  tenant    Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  guests    GuestTagAssignment[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+}
+
+model GuestTagAssignment {
+  id         String   @id @default(cuid())
+  guestId    String
+  tagId      String
+  assignedAt DateTime @default(now())
+
+  guest      Guest    @relation(fields: [guestId], references: [id], onDelete: Cascade)
+  tag        GuestTag @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([guestId, tagId])
+}
+
+model GuestNote {
+  id         String   @id @default(cuid())
+  tenantId   String
+  guestId    String
+  authorId   String?
+
+  content    String   @db.Text
+  isPinned   Boolean  @default(false) // shown prominently during service
+  isInternal Boolean  @default(true)
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  guest      Guest    @relation(fields: [guestId], references: [id], onDelete: Cascade)
+  author     User?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@index([guestId])
+  @@index([tenantId])
+}
+
+// =====================================================================
+//  RESERVATIONS
+// =====================================================================
+
+enum ReservationStatus {
+  PENDING
+  CONFIRMED
+  SEATED
+  COMPLETED
+  NO_SHOW
+  CANCELLED
+}
+
+enum ReservationSource {
+  ONLINE_WIDGET
+  PHONE
+  WALK_IN
+  HOST
+  GOOGLE_RESERVE
+  OPENTABLE
+  RESY
+  THIRD_PARTY
+  IMPORT
+}
+
+model Reservation {
+  id                 String            @id @default(cuid())
+  tenantId           String
+  guestId            String?
+  tableId            String?
+
+  reservationDate    DateTime          @db.Date
+  startTime          DateTime          // full UTC datetime
+  endTime            DateTime          // computed from dining duration
+  partySize          Int
+
+  status             ReservationStatus @default(PENDING)
+  source             ReservationSource @default(ONLINE_WIDGET)
+  confirmationCode   String            @unique @default(cuid())
+
+  // Denormalized guest info (for walk-ins & to preserve historical truth)
+  guestFirstName     String?
+  guestLastName      String?
+  guestEmail         String?
+  guestPhone         String?
+
+  occasion           String?  // "Birthday", "Anniversary"
+  specialRequests    String?  @db.Text
+  dietaryNotes       String?
+
+  seatedAt           DateTime?
+  completedAt        DateTime?
+  cancelledAt        DateTime?
+  noShowAt           DateTime?
+  cancellationReason String?
+
+  // Check total recorded after the table leaves. Optional — many restaurants
+  // type this in at the host stand; future POS integrations will set it
+  // automatically. Drives points-per-dollar in the loyalty engine.
+  spendAmount        Float?
+  spendRecordedAt    DateTime?
+
+  confirmationSentAt DateTime?
+  reminderSentAt     DateTime?
+
+  createdById        String?
+  updatedById        String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  tenant             Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  guest              Guest?    @relation(fields: [guestId], references: [id], onDelete: SetNull)
+  table              Table?    @relation(fields: [tableId], references: [id], onDelete: SetNull)
+  createdBy          User?     @relation("CreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedBy          User?     @relation("UpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  payment            Payment?
+
+  @@index([tenantId, reservationDate])
+  @@index([tenantId, status])
+  @@index([guestId])
+  @@index([tableId, startTime])
+  @@index([startTime])
+}
+
+// =====================================================================
+//  WAITLIST
+// =====================================================================
+
+enum WaitlistStatus {
+  WAITING
+  NOTIFIED
+  SEATED
+  LEFT
+  CANCELLED
+}
+
+model WaitlistEntry {
+  id                String         @id @default(cuid())
+  tenantId          String
+  guestId           String?
+
+  guestName         String
+  guestPhone        String?
+  partySize         Int
+  quotedWaitMinutes Int?
+  status            WaitlistStatus @default(WAITING)
+  notes             String?
+
+  joinedAt          DateTime       @default(now())
+  notifiedAt        DateTime?
+  seatedAt          DateTime?
+  leftAt            DateTime?
+
+  tenant            Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  guest             Guest?         @relation(fields: [guestId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, status])
+  @@index([tenantId, joinedAt])
+}
+
+// =====================================================================
+//  LOYALTY PROGRAM
+// =====================================================================
+
+model LoyaltyProgram {
+  id              String           @id @default(cuid())
+  tenantId        String           @unique
+
+  name            String           @default("Loyalty Program")
+  description     String?
+  isActive        Boolean          @default(true)
+
+  pointsPerDollar Float            @default(1)
+  pointsPerVisit  Int              @default(0)
+  redemptionRate  Float            @default(0.01) // $ per point
+
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tiers           LoyaltyTier[]
+  rewards         Reward[]
+  accounts        LoyaltyAccount[]
+}
+
+model LoyaltyTier {
+  id                String           @id @default(cuid())
+  programId         String
+  name              String           // "Bronze", "Silver", "Gold"
+  minLifetimePoints Int              @default(0)
+  multiplier        Float            @default(1.0)
+  perks             String[]         @default([])
+  color             String?          @default("#CD7F32")
+  displayOrder      Int              @default(0)
+
+  program           LoyaltyProgram   @relation(fields: [programId], references: [id], onDelete: Cascade)
+  accounts          LoyaltyAccount[]
+
+  @@unique([programId, name])
+}
+
+model LoyaltyAccount {
+  id             String               @id @default(cuid())
+  guestId        String               @unique
+  programId      String
+  tierId         String?
+  currentPoints  Int                  @default(0)
+  lifetimePoints Int                  @default(0)
+  joinedAt       DateTime             @default(now())
+
+  guest          Guest                @relation(fields: [guestId], references: [id], onDelete: Cascade)
+  program        LoyaltyProgram       @relation(fields: [programId], references: [id], onDelete: Cascade)
+  tier           LoyaltyTier?         @relation(fields: [tierId], references: [id], onDelete: SetNull)
+  transactions   LoyaltyTransaction[]
+  redemptions    RewardRedemption[]
+
+  @@index([programId])
+}
+
+enum LoyaltyTransactionType {
+  EARN
+  REDEEM
+  ADJUST
+  EXPIRE
+}
+
+model LoyaltyTransaction {
+  id            String                 @id @default(cuid())
+  accountId     String
+  type          LoyaltyTransactionType
+  points        Int                    // + earn, − redeem
+  description   String?
+  reservationId String?
+  createdAt     DateTime               @default(now())
+
+  account       LoyaltyAccount         @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId])
+}
+
+model Reward {
+  id          String             @id @default(cuid())
+  programId   String
+  name        String
+  description String?
+  imageUrl    String?
+  pointsCost  Int
+  isActive    Boolean            @default(true)
+  validFrom   DateTime?
+  validUntil  DateTime?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  program     LoyaltyProgram     @relation(fields: [programId], references: [id], onDelete: Cascade)
+  redemptions RewardRedemption[]
+}
+
+model RewardRedemption {
+  id             String         @id @default(cuid())
+  rewardId       String
+  accountId      String
+  pointsCost     Int            // snapshot at redemption time
+  redemptionCode String         @unique @default(cuid())
+  isUsed         Boolean        @default(false)
+  usedAt         DateTime?
+  createdAt      DateTime       @default(now())
+
+  reward         Reward         @relation(fields: [rewardId], references: [id], onDelete: Cascade)
+  account        LoyaltyAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+}
+
+// =====================================================================
+//  MARKETING — Segments, Templates, Campaigns
+// =====================================================================
+
+model Segment {
+  id          String          @id @default(cuid())
+  tenantId    String
+  name        String
+  description String?
+  rules       Json            // e.g. { totalVisits: { gte: 5 }, vipStatus: "VIP" }
+  isAuto      Boolean         @default(true)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  tenant      Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  members     SegmentMember[]
+  campaigns   Campaign[]
+
+  @@unique([tenantId, name])
+}
+
+model SegmentMember {
+  id        String   @id @default(cuid())
+  segmentId String
+  guestId   String
+  addedAt   DateTime @default(now())
+
+  segment   Segment  @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+  guest     Guest    @relation(fields: [guestId], references: [id], onDelete: Cascade)
+
+  @@unique([segmentId, guestId])
+  @@index([guestId])
+}
+
+enum MessageChannel {
+  EMAIL
+  SMS
+}
+
+model MessageTemplate {
+  id        String         @id @default(cuid())
+  tenantId  String
+  name      String
+  channel   MessageChannel
+  subject   String?        // email only
+  content   String         @db.Text
+  variables String[]       @default([]) // ["firstName","reservationDate"]
+  category  String?        // "Reservation Confirmation", "Birthday"
+  isSystem  Boolean        @default(false)
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  tenant    Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campaigns Campaign[]
+
+  @@unique([tenantId, name])
+}
+
+enum CampaignStatus {
+  DRAFT
+  SCHEDULED
+  SENDING
+  SENT
+  PAUSED
+  CANCELLED
+  FAILED
+}
+
+model Campaign {
+  id                String              @id @default(cuid())
+  tenantId          String
+  segmentId         String?
+  templateId        String?
+  createdById       String?
+
+  name              String
+  channel           MessageChannel
+  status            CampaignStatus      @default(DRAFT)
+
+  subject           String?
+  content           String              @db.Text
+  fromName          String?
+  fromEmail         String?
+  fromPhone         String?
+
+  scheduledAt       DateTime?
+  sentAt            DateTime?
+
+  recipientCount    Int                 @default(0)
+  sentCount         Int                 @default(0)
+  deliveredCount    Int                 @default(0)
+  openedCount       Int                 @default(0)
+  clickedCount      Int                 @default(0)
+  bouncedCount      Int                 @default(0)
+  unsubscribedCount Int                 @default(0)
+
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  tenant            Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  segment           Segment?            @relation(fields: [segmentId], references: [id], onDelete: SetNull)
+  template          MessageTemplate?    @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  createdBy         User?               @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  recipients        CampaignRecipient[]
+
+  @@index([tenantId, status])
+}
+
+enum DeliveryStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  OPENED
+  CLICKED
+  BOUNCED
+  FAILED
+  UNSUBSCRIBED
+}
+
+model CampaignRecipient {
+  id                String         @id @default(cuid())
+  campaignId        String
+  guestId           String
+  status            DeliveryStatus @default(QUEUED)
+  sentAt            DateTime?
+  deliveredAt       DateTime?
+  openedAt          DateTime?
+  clickedAt         DateTime?
+  errorMessage      String?
+  providerMessageId String?
+
+  campaign          Campaign       @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  guest             Guest          @relation(fields: [guestId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, guestId])
+  @@index([campaignId, status])
+}
+
+// =====================================================================
+//  NOTIFICATIONS  (in-app)
+// =====================================================================
+
+enum NotificationType {
+  RESERVATION_NEW
+  RESERVATION_CANCELLED
+  RESERVATION_REMINDER
+  WAITLIST_UPDATE
+  CAMPAIGN_COMPLETED
+  GUEST_BIRTHDAY
+  SYSTEM
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  tenantId  String
+  userId    String? // null = broadcast to whole tenant
+  type      NotificationType
+  title     String
+  message   String           @db.Text
+  link      String? // deep link in dashboard
+  metadata  Json?
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  tenant    Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user      User?            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, userId, readAt])
+}
+
+// =====================================================================
+//  AUDIT LOGS  (compliance + change tracking)
+// =====================================================================
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  tenantId   String
+  userId     String?
+  action     String   // e.g. "reservation.updated"
+  entityType String   // e.g. "Reservation"
+  entityId   String
+  changes    Json?    // { before: {...}, after: {...} }
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, entityType, entityId])
+  @@index([tenantId, createdAt])
+}
+
+// =====================================================================
+//  INTEGRATIONS — POS, Webhooks, API keys
+// =====================================================================
+
+enum PosProvider {
+  TOAST
+  SQUARE
+  LIGHTSPEED
+  CLOVER
+  CUSTOM
+}
+
+model PosIntegration {
+  id                 String      @id @default(cuid())
+  tenantId           String
+  provider           PosProvider
+  isActive           Boolean     @default(true)
+
+  // Credentials are stored encrypted at rest at the application layer
+  accessToken        String?     @db.Text
+  refreshToken       String?     @db.Text
+  expiresAt          DateTime?
+
+  externalLocationId String?
+  config             Json?
+
+  lastSyncAt         DateTime?
+  lastSyncStatus     String?
+
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @updatedAt
+
+  tenant             Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, provider])
+}
+
+model Webhook {
+  id                 String   @id @default(cuid())
+  tenantId           String
+  url                String
+  secret             String   // for HMAC signing
+  events             String[] // ["reservation.created","guest.updated",...]
+  isActive           Boolean  @default(true)
+  lastDeliveryAt     DateTime?
+  lastDeliveryStatus Int?
+  failureCount       Int      @default(0)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  tenant             Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  deliveries         WebhookDelivery[]
+
+  @@index([tenantId])
+}
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  tenantId   String
+  name       String
+  keyHash    String    @unique // store SHA-256 hash, never plaintext
+  prefix     String              // first 8 chars for display
+  scopes     String[]  @default([])
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  tenant     Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+}
+
+// =====================================================================
+//  PHASE 8 — PAYMENTS (guest deposits via Stripe Checkout)
+// =====================================================================
+
+enum PaymentStatus {
+  PENDING       // checkout session created, awaiting completion
+  AUTHORIZED    // payment_intent succeeded, funds captured
+  REFUNDED      // fully refunded
+  PARTIAL_REFUND
+  FAILED        // payment failed
+  CANCELLED     // checkout session expired or cancelled
+}
+
+model Payment {
+  id                      String         @id @default(cuid())
+  tenantId                String
+  reservationId           String         @unique
+  amount                  Float
+  currency                String         @default("usd")
+  status                  PaymentStatus  @default(PENDING)
+
+  // Stripe references
+  stripeCheckoutSessionId String?        @unique
+  stripePaymentIntentId   String?        @unique
+  stripeChargeId          String?
+  refundedAmount          Float?
+
+  // URLs
+  checkoutUrl             String?        // hosted Checkout page URL
+  receiptUrl              String?
+
+  authorizedAt            DateTime?
+  refundedAt              DateTime?
+  failedAt                DateTime?
+  failureMessage          String?
+
+  createdAt               DateTime       @default(now())
+  updatedAt               DateTime       @updatedAt
+
+  tenant                  Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reservation             Reservation    @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, status])
+  @@index([reservationId])
+}
+
+// =====================================================================
+//  PHASE 8 — WEBHOOK DELIVERY LEDGER (every outbound attempt tracked)
+// =====================================================================
+
+enum WebhookDeliveryStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+model WebhookDelivery {
+  id            String                @id @default(cuid())
+  webhookId     String
+  event         String                // "reservation.created", etc.
+  payload       Json
+  status        WebhookDeliveryStatus @default(PENDING)
+  attemptCount  Int                   @default(0)
+  lastAttemptAt DateTime?
+  responseCode  Int?
+  responseBody  String?
+  errorMessage  String?
+  createdAt     DateTime              @default(now())
+
+  webhook       Webhook               @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([webhookId, status])
+  @@index([createdAt])
+}
