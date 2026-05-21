@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Fraunces, Geist, Geist_Mono } from "next/font/google";
+import { SpeedInsights } from "@vercel/speed-insights/next";
 import { Providers } from "@/components/providers";
 import { APP_NAME, APP_TAGLINE } from "@/lib/constants";
 import "./globals.css";
@@ -35,6 +36,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en" suppressHydrationWarning>
       <body className={`${fraunces.variable} ${geist.variable} ${geistMono.variable} font-sans`}>
         <Providers>{children}</Providers>
+        <SpeedInsights />
       </body>
     </html>
   );
