@@ -108,7 +108,7 @@ function ShiftSection({
           {items.length} {items.length === 1 ? "booking" : "bookings"} · {totalCovers} covers
         </p>
       </header>
-      <ul className="mt-4 divide-y divide-border overflow-hidden rounded-lg border border-border bg-card">
+      <ul className="mt-4 divide-y divide-border rounded-lg border border-border bg-card [&>li:first-child]:rounded-t-lg [&>li:last-child]:rounded-b-lg">
         {items.map((r) => (
           <ReservationRow key={r.id} reservation={r} />
         ))}

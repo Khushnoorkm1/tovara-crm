@@ -116,7 +116,7 @@ function ActionsMenu({ reservation }: { reservation: ReservationListItem }) {
       {open ? (
         <div
           role="menu"
-          className="absolute right-0 top-9 z-10 w-48 origin-top-right animate-fade-in rounded-md border border-border bg-popover p-1 shadow-lg"
+          className="absolute right-0 top-9 z-50 w-48 origin-top-right animate-fade-in rounded-md border border-border bg-popover p-1 shadow-lg"
         >
           <MenuItem onClick={() => router.push(`/reservations/${reservation.id}`)} icon={<Pencil className="h-3.5 w-3.5" />}>
             Edit details
